@@ -3,7 +3,7 @@
 
 [agent] The register of the architecture refactor routine, rendered from `register/10-refactor.md` on the [`arch-audit/ledger`](https://github.com/SocketDev/socket-patch/tree/arch-audit/ledger) branch on every run.
 
-_Last updated 2026-11-28 · 33 runs under this charter · `main` at cfc870f when examined._
+_Last updated 2026-11-28 · 34 runs under this charter · `main` at cfc870f when examined._
 
 ### In flight
 | PR | Issue | State |
@@ -14,7 +14,7 @@ _Last updated 2026-11-28 · 33 runs under this charter · `main` at cfc870f when
 
 `hosted-e2e` is red on all three: it needs #2270 (a production gem patch the suite does not pin; #2280 is open for it), then a re-run.
 
-**Next PR:** #2301 (a cleanup deletes the project's files), then #2303, #2305, #2308, #2310, #2312, #2314 and #2317 (seven tools' copies; #2312 and #2314 share a fix), #2287 (a printed credential), #2330 and #2332 (a tampered tarball, or jar, passes the check), #2290, #2299, #2327, #2318, #2321, #2286, #2289 and #2315 (a stale VEX document): the most harm. Then #2259, #2294, #2296, #2271, L22 (once #2261 merges: same function), #647, #1917, #1926, #1860, #1836, #2306, #2322, #2324, #2328 (low), #2319 and #2333 (test only). #2277, #2297 and #2309 wait for a maintainer's answer.
+**Next PR:** #2301 (a cleanup deletes the project's files), then #2303, #2305, #2308, #2310, #2312, #2314 and #2317 (seven tools' copies; #2312 and #2314 share a fix), #2287 (a printed credential), #2330 and #2332 (a tampered tarball or jar passes), #2290, #2299, #2327 with #2334, #2318, #2321, #2286, #2289 and #2315 (a stale VEX document). Then #2259, #2294, #2296, #2271, L22 (after #2261), #647, #1917, #1926, #1860, #1836, #2306, #2322, #2324, #2328 (low), #2319 and #2333 (test only). #2277, #2297 and #2309 wait for a maintainer's answer.
 
 ### Merged
 | PR | Fixed |
@@ -36,7 +36,7 @@ L01 to L18 came from earlier audits, the rest from this routine. A row is a hypo
 | L09, L15, L26–L29, L31, L32, L35, L39, L45, L62, L66 | (collapsed) | core and CLI: named in the entries | out of charter; L09, L15, L26 and L31 need a decision the contract doesn't settle. The contract allows L27 to L29, L32, L35 and L45. L39: the contract's telemetry list omits a `ci` flag. L62: a Node addon test of cancel latency mostly passes without the race it names; no gate behavior. L66: no test names the blob download's hash check (#2333). All ran but L28 and L29 |
 | L14 | scala-cli `discover` collapses unreadable files and cap breaches into `None`, so the user is told to run `scala-cli compile` | core JVM crawlers | to verify; read: no real project reaches the caps. Open: a non-project `.json` in Bloop's directory. Needs scala-cli |
 | L22 | the prune GC raises no Go undo warning after it reverts a vendored Go module | CLI `vendor.rs` `run_vendor_gc` | filed #1910 (its last bullet); ran it: `scan --prune` says nothing where the undo commands warn (#1778) |
-| L06, L25, L30, L33, L34, L36–L38, L40–L44, L46–L61, L63–L65 | (collapsed) | CLI commands; core `patch/`, `crawlers/`, `vendor/`, `hosted/`, `policy/`, `manifest/`, `formats/cargo/`, `formats/pnpm/`, `utils/`, `origin.rs`: named in the issues | filed #2259, #2271, #2277, #2286, #2287, #2289, #2290, #2294, #2296, #2297, #2299, #2301, #2303, #2305, #2306, #2308 to #2310, #2312, #2314, #2315, #2317 to #2319, #2321, #2322, #2324, #2327, #2328, #2330, #2332, #2333, in lead order; each ran |
+| L06, L25, L30, L33, L34, L36–L38, L40–L44, L46–L61, L63–L65, L67 | (collapsed) | CLI commands; core `patch/`, `crawlers/`, `vendor/`, `hosted/`, `policy/`, `manifest/`, `formats/cargo/`, `formats/pnpm/`, `utils/`, `origin.rs`: named in the issues | filed #2259, #2271, #2277, #2286, #2287, #2289, #2290, #2294, #2296, #2297, #2299, #2301, #2303, #2305, #2306, #2308 to #2310, #2312, #2314, #2315, #2317 to #2319, #2321, #2322, #2324, #2327, #2328, #2330, #2332 to #2334, in lead order; each ran |
 
 Issues looked at:
 
@@ -48,13 +48,13 @@ Issues looked at:
 | #1917, #1926, #1860, #647, #1836 | confirmed; each ran |
 | 42 issues, named in the entries | out of charter; each ran or was read (14 read only) |
 | #1114 | fixed in part (#2229); the CI janitor holds the rest |
-| the other 29 open issues | out of charter by title, or "Decide:" issues (the 18:55Z entry). Every `arch-audit` issue open at 06:55Z on 2026-11-28 has been looked at |
+| the other 29 open issues | out of charter by title, or "Decide:" issues (the 18:55Z entry). Every `arch-audit` issue open at 08:55Z of 11-28 has been looked at |
 
 ### Areas examined
 | Area | Date | `main` | Found |
 |---|---|---|---|
 | agent mode's undo, prune, output and broken inputs; `--json` / `--silent`; Gradle; the vlt heal; failing toolchains; credentials in project files; purl spellings; cache crawls; hosted mode on the bench's 20 package managers, vendored mode on 8; the `socket.yml` policy and filter; telemetry; `vex --grype-config`; the socket-cli config file; a monorepo | 2026-11-25, 11-26 | 332b3e8 to cfc870f | the PRs and issues up to #2297; the rest clean |
-| the patch API failing mid-run; `report`; `--update`; a newer patch for a patched package; linked `.socket/` stores; the contract's `jq` recipes; undo targets; a manifest outside `.socket/`; the in-memory hosted engine; the update notice; partial hosted writes; the project-patch gate and Cargo's agent mode with the real tools; a native-extension gem; agent mode against the copy each real tool loads (seven layouts); the VEX flags; `--vex` after a failed host command; the entrypoint command; signals and closed pipes; the rollout limit; undo, lock and drift flags; wrong blobs from the API; linked installs; `-g` with seven real tools; a Git checkout of each committed tree; 44 gate mutants; the patch mirror; failing writes; version and range readers against the tools' libraries; escaping paths; the Node addon; boolean env spellings; the pnpm route's cleanup; size limits; the tarball readers against four installers; a jar entry held twice against seven readers | 2026-11-27, 11-28 | cfc870f | the issues from #2299 to #2333 in the Leads row; the rest clean |
+| the patch API failing mid-run; `report`; `--update`; a newer patch for a patched package; linked `.socket/` stores; the contract's `jq` recipes; undo targets; a manifest outside `.socket/`; the in-memory hosted engine; the update notice; partial hosted writes; the project-patch gate and Cargo's agent mode with the real tools; a native-extension gem; agent mode against the copy each real tool loads (seven layouts); the VEX flags; `--vex` after a failed host command; the entrypoint command; signals and closed pipes; the rollout limit; undo, lock and drift flags; wrong blobs from the API; linked installs; `-g` with seven real tools; a Git checkout of each committed tree; 44 gate mutants; the patch mirror; failing writes; version and range readers against the tools' libraries; escaping paths; the Node addon; boolean env spellings; the pnpm route's cleanup; size limits; the tarball readers against four installers; a jar entry held twice against seven readers; VEX product detection; a merge conflict in five locks | 2026-11-27, 11-28 | cfc870f | the issues from #2299 to #2334 in the Leads row; the rest clean |
 
 ### Notes
 - Build with `CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0` on every cargo call. Leave `CARGO_TARGET_DIR` unset: the Cargo suites' `apply` deletes fingerprints in it, and the next call rebuilds. A cold CLI build takes 3 minutes, core's unit tests 4 and 9 GB: never during a test run.
@@ -65,7 +65,7 @@ Issues looked at:
 - Run the built binary over small broken projects and compare the commands. Set `SOCKET_TELEMETRY_DISABLED=1 SOCKET_NO_CONFIG=1`. For a patch API use the bench: `socket-patch-bench serve <pm>/hosted --bin <cli> --scale 0.02 --work-dir <dir>` builds a hosted project for any of 20 package managers and prints its command (runner: the 18:55Z entry). Its env refuses outside registries, so an undo fails except for Hatch, Maven and Gradle. Fixtures: a held `apply.lock` (08:56Z of 11-26), a stand-in API (22:56Z), failure rules (00:55Z of 11-27), real-tool layouts (08:55Z), wrong blobs (18:56Z).
 - Vendored mode runs on files alone, with `tests/prebuilt_common`'s `Server::project(<dir>)` held open by a throwaway ignored test as the vendor service (the 20:56Z entry). Building a test rebuilds `target/debug/socket-patch` with core's test features: copy the plain binary aside first.
 - A throwaway probe test over the lead's input settles it in one rebuild. For a test that can't fail, mutate production and keep the diff (#2267). Many mutants fit one build behind an env variable (20:56Z of 11-27). Mutate the call site, and call none a survivor before every suite naming its ecosystem ran (06:55Z of 11-28).
-- The owner was notified of the three waiting PRs and of each issue from #2277 to #2332 (not #2319, #2324, #2328 or #2333: low harm). Don't notify again for the waiting PRs alone or for more sites of a filed issue.
+- The owner was notified of the three waiting PRs and of each issue from #2277 to #2334 (not #2319, #2324, #2328 or #2333: low harm). Don't notify again for the waiting PRs alone or for more sites of a filed issue.
 - Run `/code-review high` until a pass finds no real defect (#2261 took three), and the `cli` suite after touching any test file (it holds ratchets over `tests/`).
 - Most open `agent/*` PRs edit `CLI_CONTRACT.md`: far-apart hunks are fine (#2261).
 - `main` requires every review thread resolved: an open one silently blocks an approved PR. A push does not dismiss approvals.
@@ -78,5 +78,5 @@ Issues looked at:
 - Ask the package manager what it reads, then compare: `cargo metadata` names the copy cargo builds (#2305), `uv run python -c 'import x; print(x.__file__)'` the one Python imports (#2308), `bundle exec ruby -e` with `$LOADED_FEATURES` the gem (#2317). Run it from a workspace member and with another virtualenv activated. An agent-mode or `-g` Python run can write the OS Python: use `--dry-run`, or roll back and run `dpkg --verify`. Run every spelling of a key (#2306). Scan before asking: `pdm run` saves `.pdm-python` again (#2310). Maven's, Go's and Gradle's commands are in #2312 and #2314. As root, `yarn global add` and `bundle install` write outside `HOME`: uninstall after.
 - A prune GC test over a real revert needs no toolchain: hand-build a ledger entry as `apply_gc_reports_drift_kept_vendored_entry` (`scan/gc.rs`) does.
 - A script named after a tool, first on `PATH`, is a failing or hanging probe.
-- Before filing a drift between lock readers, read `docs/design/lock-model-divergences.md`: the owner's list of known ones, each with a decision.
-- Recipes, in their issues: unordered output (#1836), a stale output file (#2315), the user's files beside a layout (#2301), subsets of a run's writes (#2303), a planted token (#2287), an autocrlf clone (#2318), a mirror stand-in and a failing write (the 22:56Z entry), a reader against its tool's library (00:56Z of 11-28), the Node addon, conflict markers and route states from the golden fixtures (02:55Z), a tarball the installers read past (#2330), a name twice in a jar and a JVM tree's hash chain (#2332).
+- Before filing a drift between lock readers, read `docs/design/lock-model-divergences.md`: the owner's decided list.
+- Recipes, in their issues: unordered output (#1836), a stale output file (#2315), the user's files beside a layout (#2301), subsets of a run's writes (#2303), a planted token (#2287), an autocrlf clone (#2318), a mirror stand-in and a failing write (the 22:56Z entry), a reader against its tool's library (00:56Z of 11-28), the Node addon and route states from the golden fixtures (02:55Z), a merge conflict (#2334), a tarball the installers read past (#2330), a name twice in a jar and a JVM tree's hash chain (#2332).
