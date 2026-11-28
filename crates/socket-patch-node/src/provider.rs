@@ -169,6 +169,20 @@ fn missing_value(method: &str) -> ApiError {
     ))
 }
 
+/// The `fetchRegistryReferences` request for `uuids`: the v0 API's body,
+/// with the registry snapshots the project's Bundler lock names for them.
+fn references_request(
+    uuids: &[String],
+    gem_snapshots: &socket_patch_core::api::client::GemSnapshotKeys,
+) -> serde_json::Value {
+    let presented = socket_patch_core::api::client::gem_snapshots_for(uuids, gem_snapshots);
+    let mut request = serde_json::json!({ "uuids": uuids });
+    if !presented.is_empty() {
+        request["gemSnapshotKeys"] = serde_json::json!(presented);
+    }
+    request
+}
+
 impl PatchApi for JsPatchApi {
     fn uses_public_proxy(&self) -> bool {
         false
@@ -213,19 +227,19 @@ impl PatchApi for JsPatchApi {
         })
     }
 
-    // This host does not ask for a gem's listing: its request names the
-    // uuids alone, so it has no registry snapshot to present.
+    // The request is the v0 API's body: `gemSnapshotKeys` rides in it where
+    // a lock names a snapshot of one of `uuids`, and is left out otherwise.
     fn fetch_registry_references<'a>(
         &'a self,
         uuids: &'a [String],
-        _gem_snapshots: &'a socket_patch_core::api::client::GemSnapshotKeys,
+        gem_snapshots: &'a socket_patch_core::api::client::GemSnapshotKeys,
     ) -> ApiFuture<'a, HashMap<String, PackageVendorResult>> {
         Box::pin(async move {
             if uuids.is_empty() {
                 return Ok(HashMap::new());
             }
             let method = "fetchRegistryReferences";
-            let request = serde_json::json!({ "uuids": uuids }).to_string();
+            let request = references_request(uuids, gem_snapshots).to_string();
             match call_json::<ReferencesBody>(method, &self.fetch_registry_references, request)
                 .await?
             {

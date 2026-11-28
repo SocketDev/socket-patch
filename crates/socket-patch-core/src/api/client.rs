@@ -1346,12 +1346,7 @@ impl ApiClient {
         let path = self.patches_path("package");
         let mut results = std::collections::HashMap::new();
         for chunk in uuids.chunks(MAX_REFERENCE_BATCH) {
-            let asked = |uuid: &&String| chunk.iter().any(|u| u.eq_ignore_ascii_case(uuid));
-            let presented = gem_snapshots
-                .iter()
-                .filter(|(uuid, _)| asked(uuid))
-                .map(|(uuid, key)| (uuid.clone(), key.clone()))
-                .collect();
+            let presented = gem_snapshots_for(chunk, gem_snapshots);
             let body = PackageVendorRequest::new(chunk, false, presented);
             let resp = self
                 .post_json::<PackageVendorResponse, _>(&path, &body)
@@ -3524,6 +3519,16 @@ pub type ApiFuture<'a, T> =
 /// ([`crate::patch::redirect::gem_lock_snapshot_keys`]), a short string of
 /// lowercase hexadecimal digits.
 pub type GemSnapshotKeys = std::collections::BTreeMap<String, String>;
+
+/// The entries of `held` for the patches `uuids` (in any case): what one
+/// reference request about `uuids` presents.
+pub fn gem_snapshots_for(uuids: &[String], held: &GemSnapshotKeys) -> GemSnapshotKeys {
+    let asked = |uuid: &&String| uuids.iter().any(|u| u.eq_ignore_ascii_case(uuid));
+    held.iter()
+        .filter(|(uuid, _)| asked(uuid))
+        .map(|(uuid, key)| (uuid.clone(), key.clone()))
+        .collect()
+}
 
 /// The patch-data calls the hosted flow makes, as an object-safe trait so an
 /// embedding host (the in-memory engine, a napi addon) can serve them

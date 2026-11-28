@@ -1026,10 +1026,12 @@ async fn engine(
         .filter(|s| s.error.is_none())
         .flat_map(|s| s.selected.iter().map(|(_, u)| u.clone()))
         .collect();
+    let gem_snapshots =
+        discover::gem_snapshots_of(states.iter().filter_map(|state| state.project.as_ref()));
     let (references, failed_refs) = if uuids.is_empty() {
         (HashMap::new(), BTreeMap::new())
     } else {
-        discover::fetch_references(&provider, &uuids).await
+        discover::fetch_references(&provider, &uuids, &gem_snapshots).await
     };
     // Roots whose rows' eligibility is unknown: a reference failure that
     // hit only NEW rows of a capped run defers them instead of failing the
@@ -1157,7 +1159,8 @@ async fn engine(
             .collect();
         if !unknown.is_empty() {
             // A request that fails answers for none of them.
-            let (answered, _) = discover::fetch_references(&provider, &unknown).await;
+            let (answered, _) =
+                discover::fetch_references(&provider, &unknown, &gem_snapshots).await;
             answers.extend(answered);
         }
         for ((_, plan), targets) in planned.iter_mut().zip(&refreshes) {

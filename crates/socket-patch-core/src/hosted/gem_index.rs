@@ -123,11 +123,7 @@ pub async fn read_gem_refreshes(
         // A request that fails answers for none of them.
         // The lock stays on such a patch's registry: its request presents
         // the snapshot the lock names.
-        let held = ["gems.locked", "Gemfile.lock"]
-            .iter()
-            .filter_map(|lock| read.files.get(*lock))
-            .flat_map(|lock| crate::patch::redirect::gem_lock_snapshot_keys(lock))
-            .collect();
+        let held = crate::patch::redirect::gem_project_snapshot_keys(&read.files);
         let asked = client.fetch_registry_references(&unknown, &held).await;
         references.extend(asked.unwrap_or_default());
     }

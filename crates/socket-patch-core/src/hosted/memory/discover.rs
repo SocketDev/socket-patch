@@ -12,11 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::Duration;
 
-/// No registry snapshot to present: see [`Provider::fetch_registry_references`].
-static NO_GEM_SNAPSHOTS: crate::api::client::GemSnapshotKeys =
-    crate::api::client::GemSnapshotKeys::new();
-
-use crate::api::client::{ApiError, ApiFuture, PatchApi};
+use crate::api::client::{ApiError, ApiFuture, GemSnapshotKeys, PatchApi};
 use crate::api::ranking::cmp_search_results;
 use crate::api::types::{BatchPackagePatches, PackageVendorResult, SearchResponse};
 use crate::hosted::engine::leave_out_platform_gem_patches;
@@ -140,13 +136,11 @@ impl Provider {
     pub(crate) async fn fetch_registry_references(
         &self,
         uuids: &[String],
+        gem_snapshots: &GemSnapshotKeys,
     ) -> Result<HashMap<String, PackageVendorResult>, ApiError> {
-        // The in-memory hosts do not ask for a gem's listing with this
-        // call (their request names the uuids alone), so there is no
-        // snapshot to present.
         self.call(
             "fetchRegistryReferences",
-            self.api.fetch_registry_references(uuids, &NO_GEM_SNAPSHOTS),
+            self.api.fetch_registry_references(uuids, gem_snapshots),
         )
         .await
     }
@@ -297,6 +291,28 @@ pub(crate) async fn batch_search(
     outcome
 }
 
+/// The registry snapshots the Bundler locks of `projects` take gems from
+/// ([`crate::patch::redirect::gem_project_snapshot_keys`]), by patch uuid.
+/// One request answers for every root, so where two roots name different
+/// snapshots of one patch the first root's is presented: the answer to it
+/// (that snapshot, or not ready) is one the other root's lock can follow.
+pub(crate) fn gem_snapshots_of<'a>(
+    projects: impl Iterator<Item = &'a crate::vendor::lock_inventory::MemoryProject>,
+) -> GemSnapshotKeys {
+    use crate::patch::redirect::{gem_project_snapshot_keys, GEM_SNAPSHOT_FILES};
+    let mut held = GemSnapshotKeys::new();
+    for project in projects {
+        let files = GEM_SNAPSHOT_FILES
+            .iter()
+            .filter_map(|name| Some((name.to_string(), project.text(name)?.to_string())))
+            .collect();
+        for (uuid, key) in gem_project_snapshot_keys(&files) {
+            held.entry(uuid).or_insert(key);
+        }
+    }
+    held
+}
+
 /// `search_patches_by_package` once per distinct purl.
 pub(crate) async fn fetch_details(
     provider: &Provider,
@@ -317,9 +333,12 @@ pub(crate) async fn fetch_details(
 
 /// Reference grants for every distinct uuid (`MAX_REFERENCE_BATCH` per
 /// request): the merged results, plus the uuids whose request failed.
+/// `gem_snapshots` are the registry snapshots the roots' Bundler locks
+/// take gems from ([`gem_snapshots_of`]), presented with each request.
 pub(crate) async fn fetch_references(
     provider: &Provider,
     uuids: &BTreeSet<String>,
+    gem_snapshots: &GemSnapshotKeys,
 ) -> (
     HashMap<String, PackageVendorResult>,
     BTreeMap<String, String>,
@@ -331,7 +350,9 @@ pub(crate) async fn fetch_references(
         .collect();
     let futures: Vec<BoxFuture<'_, _>> = chunks
         .iter()
-        .map(|chunk| -> BoxFuture<'_, _> { Box::pin(provider.fetch_registry_references(chunk)) })
+        .map(|chunk| -> BoxFuture<'_, _> {
+            Box::pin(provider.fetch_registry_references(chunk, gem_snapshots))
+        })
         .collect();
     let results = join_bounded(futures, provider.concurrency).await;
     let mut merged: HashMap<String, PackageVendorResult> = HashMap::new();
@@ -476,6 +497,38 @@ pub(crate) async fn fetch_classic_artifacts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The snapshots of every root's lock are presented, each read from
+    /// the lock that root's rewrite edits; where two roots name different
+    /// snapshots of one patch, the first root's stands.
+    #[test]
+    fn the_snapshots_of_the_roots_locks_are_gathered_first_root_first() {
+        use crate::vendor::lock_inventory::MemoryProject;
+        let (one, two) = (
+            "7b1e4f3a-2c5d-4e6f-8a9b-0c1d2e3f4a5b",
+            "2b3c4d5e-6f7a-4b8c-9d0e-1f2a3b4c5d6e",
+        );
+        let lock = |uuid: &str, key: &str| {
+            format!(
+                "GEM\n  remote: https://patch.test/patch-registry/gem/tok/{uuid}/s/{key}/\n  \
+                 specs:\n    nokogiri (1.18.10-arm64-darwin)\n"
+            )
+        };
+        let mut first = MemoryProject::new();
+        first.insert_text("Gemfile.lock", lock(one, "aa"));
+        let mut second = MemoryProject::new();
+        second.insert_text("gems.rb", "");
+        second.insert_text("gems.locked", lock(one, "bb") + &lock(two, "cc"));
+        second.insert_text("Gemfile.lock", lock(two, "dd"));
+        let held = gem_snapshots_of([&first, &second].into_iter());
+        let expected: GemSnapshotKeys = [
+            (one.to_string(), "aa".to_string()),
+            (two.to_string(), "cc".to_string()),
+        ]
+        .into();
+        assert_eq!(held, expected);
+        assert!(gem_snapshots_of(std::iter::empty()).is_empty());
+    }
     use crate::api::types::PatchSearchResult;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

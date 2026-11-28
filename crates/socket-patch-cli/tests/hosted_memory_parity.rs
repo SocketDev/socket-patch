@@ -767,6 +767,79 @@ async fn parity_gemfile_platform_no_patched_build() {
     assert_eq!(skip.detail.as_deref(), Some(detail));
 }
 
+/// A lock on its patch's registry while a gem that registry lists is being
+/// built again. The patch service answers by the key a request presents:
+/// the registry for its own key, not ready for another, the ruby gem's
+/// registry alone for none. Both engines present the key their lock
+/// names, the in-memory one through its provider call, so both leave the
+/// pair byte for byte and warn of nothing.
+#[tokio::test]
+async fn parity_gemfile_platform_lock_on_its_patch_through_a_rebuild() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    const FIX: &str = "77777777-7777-7777-7777-777777777777";
+    let dir = fixtures_root().join("redirect/gem/bundler/platform-pass-through");
+    let server = MockServer::start().await;
+    let patches = patches_from_overrides(&dir.join("overrides.json"), Some(&server.uri()));
+    mount_api(&server, &patches).await;
+    let mut files = fixture_files(&dir.join("expected"));
+    for bytes in files.values_mut() {
+        let text = String::from_utf8(bytes.clone()).expect("a text fixture");
+        *bytes = text
+            .replace("https://patch.socket.dev", &server.uri())
+            .into_bytes();
+    }
+    let lock = String::from_utf8_lossy(&files["Gemfile.lock"]).into_owned();
+    assert!(lock.contains(&format!("/{FIX}/s/4/\n")), "premise: {lock}");
+    let listed = patches[0].reference.clone();
+    let mut plain = listed.clone();
+    let registry = &mut plain["registryOverride"];
+    let index = registry["indexUrl"].as_str().expect("an index URL");
+    let root = index.split("/s/").next().expect("a registry root");
+    registry["indexUrl"] = serde_json::json!(format!("{root}/"));
+    let identifiers = registry["identifiers"].as_object_mut();
+    identifiers.expect("identifiers").remove("gemBuilds");
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(move |request: &wiremock::Request| {
+            let asked: Value = serde_json::from_slice(&request.body).unwrap_or_default();
+            let answer = match asked["gemSnapshotKeys"][FIX].as_str() {
+                Some("4") => listed.clone(),
+                Some(_) => serde_json::json!({
+                    "status": "pending_build", "url": null, "purl": null, "artifacts": [],
+                    "registryOverride": null,
+                }),
+                None => plain.clone(),
+            };
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "results": { FIX: answer } }))
+        })
+        .with_priority(1)
+        .mount(&server)
+        .await;
+
+    let name = "a lock on its patch through a rebuild";
+    let (redirect, project) = assert_parity_over(name, &server, &files, false, false).await;
+    assert_eq!(
+        redirect["rewrittenFiles"],
+        serde_json::json!([]),
+        "{redirect:#}"
+    );
+    assert_eq!(redirect["warnings"], serde_json::json!([]), "{redirect:#}");
+    assert!(project.skipped.is_empty(), "{:?}", project.skipped);
+    let asked = server.received_requests().await.unwrap_or_default();
+    let presented: Vec<Value> = asked
+        .iter()
+        .filter(|request| request.url.path().ends_with("/patches/package"))
+        .map(|request| serde_json::from_slice::<Value>(&request.body).unwrap_or_default())
+        .map(|body| body["gemSnapshotKeys"][FIX].clone())
+        .collect();
+    assert!(
+        presented.len() >= 2 && presented.iter().all(|key| key == "4"),
+        "both engines present the snapshot the lock is on: {presented:?}"
+    );
+}
+
 /// The gem fixture as the root of a Bazel workspace whose rules_ruby hub
 /// reads the lock and names the patched gem in `gem_checksums`. With the
 /// sha256 of the upstream archive there, the checkout and the engine write

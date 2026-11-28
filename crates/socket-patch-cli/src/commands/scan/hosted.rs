@@ -1846,27 +1846,25 @@ struct HostedTelemetry {
     json_error: Option<Envelope>,
 }
 
-/// The registry snapshots the Bundler lock in `cwd` already takes gems
-/// from, by patch uuid: what the run's reference requests present, so
-/// that the patch service answers the listing the lock holds while a gem
-/// of it is being built again
-/// ([`ApiClient::fetch_registry_references`]). The key of a remote is the
-/// snapshot level the rewriter recognises: lowercase hexadecimal digits.
+/// The registry snapshots the Bundler lock of the project in `cwd` takes
+/// gems from, by patch uuid: what the run's reference requests present
+/// ([`ApiClient::fetch_registry_references`]). The lock is the one the
+/// rewriter edits ([`gem_project_snapshot_keys`]).
 ///
 /// [`ApiClient::fetch_registry_references`]: socket_patch_core::api::client::ApiClient::fetch_registry_references
+/// [`gem_project_snapshot_keys`]: socket_patch_core::patch::redirect::gem_project_snapshot_keys
 pub(super) async fn gem_lock_snapshots(
     cwd: &Path,
 ) -> socket_patch_core::api::client::GemSnapshotKeys {
-    use socket_patch_core::patch::redirect::gem_lock_snapshot_keys;
-    let mut held = socket_patch_core::api::client::GemSnapshotKeys::new();
-    for lock in ["gems.locked", "Gemfile.lock"] {
-        let lock = cwd.join(lock);
-        let read = socket_patch_core::utils::fs::read_regular_to_string(&lock);
-        if let Ok(text) = read.await {
-            held.extend(gem_lock_snapshot_keys(&text));
+    use socket_patch_core::patch::redirect::{gem_project_snapshot_keys, GEM_SNAPSHOT_FILES};
+    let mut files = std::collections::BTreeMap::new();
+    for name in GEM_SNAPSHOT_FILES {
+        let path = cwd.join(name);
+        if let Ok(text) = socket_patch_core::utils::fs::read_regular_to_string(&path).await {
+            files.insert(name.to_string(), text);
         }
     }
-    held
+    gem_project_snapshot_keys(&files)
 }
 
 #[allow(clippy::too_many_arguments)]

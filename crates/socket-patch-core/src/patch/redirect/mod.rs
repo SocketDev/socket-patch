@@ -8295,6 +8295,22 @@ pub fn gem_lock_snapshot_keys(lock: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// The names [`gem_project_snapshot_keys`] reads among a project's files.
+pub const GEM_SNAPSHOT_FILES: [&str; 3] = ["gems.rb", "gems.locked", "Gemfile.lock"];
+
+/// [`gem_lock_snapshot_keys`] of the one Bundler lock a run rewrites among
+/// a project's `files` ([`gem_pair`]): `gems.locked` where the project has
+/// a `gems.rb`, else `Gemfile.lock`. A lock of the other spelling is one
+/// Bundler does not read there, so its registries say nothing of the
+/// project. What every reference request of a run presents.
+pub fn gem_project_snapshot_keys(files: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let (_, lock) = gem_pair(files);
+    files
+        .get(lock)
+        .map(|lock| gem_lock_snapshot_keys(lock))
+        .unwrap_or_default()
+}
+
 /// The address a gem takes its patch registry under in the manifest and
 /// the lock, from the `index_url` of its reference.
 ///
@@ -24487,6 +24503,34 @@ mod tests {
         assert_eq!(gem_lock_snapshot_keys(&lock), held);
         assert_eq!(gem_lock_snapshot_keys(&lock.replace('\n', "\r\n")), held);
         assert_eq!(gem_lock_snapshot_keys(""), BTreeMap::new());
+    }
+
+    /// A project's snapshots are those of the lock a run rewrites: of
+    /// `gems.locked` where it has a `gems.rb`, of `Gemfile.lock` where it
+    /// has none. A lock of the other spelling says nothing.
+    #[test]
+    fn a_projects_registry_snapshots_are_those_of_the_lock_a_run_rewrites() {
+        let uuid = "7b1e4f3a-2c5d-4e6f-8a9b-0c1d2e3f4a5b";
+        let lock = |key: &str| {
+            format!(
+                "GEM\n  remote: https://patch.test/patch-registry/gem/tok/{uuid}/s/{key}/\n  \
+                 specs:\n    nokogiri (1.18.10-arm64-darwin)\n"
+            )
+        };
+        let held = |key: &str| -> BTreeMap<String, String> {
+            [(uuid.to_string(), key.to_string())].into()
+        };
+        let mut files: BTreeMap<String, String> = [
+            ("Gemfile.lock".to_string(), lock("aa")),
+            ("gems.locked".to_string(), lock("bb")),
+        ]
+        .into();
+        assert_eq!(gem_project_snapshot_keys(&files), held("aa"));
+        files.insert("gems.rb".to_string(), String::new());
+        assert_eq!(gem_project_snapshot_keys(&files), held("bb"));
+        assert_eq!(gem_pair(&files).1, "gems.locked", "the rewriter's lock");
+        files.remove("gems.locked");
+        assert_eq!(gem_project_snapshot_keys(&files), BTreeMap::new());
     }
 
     /// The snapshot level of a registry URL is read off its end (an
