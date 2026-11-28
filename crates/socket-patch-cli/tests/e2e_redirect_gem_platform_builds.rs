@@ -218,28 +218,39 @@ async fn mount_api(server: &MockServer, listing: Option<(&[Listed], u32)>) {
         .await;
 }
 
-/// [`mount_api`] while a patched build that the snapshot `held` lists is
-/// being built again. The registry as it stands (`current`) lists
-/// upstream's own gem for that platform, under another snapshot: that is
-/// what a request with no key is answered. A request that presents the
-/// key of `held` (`gemSnapshotKeys`) is answered that snapshot as it was.
-async fn mount_api_rebuilding(
-    server: &MockServer,
-    held: (&[Listed], u32),
-    current: (&[Listed], u32),
-) {
+/// [`mount_api`] while a gem that the registry `current` lists is being
+/// built again: the registry lists what it listed, under its key. A request
+/// that presents that key (`gemSnapshotKeys`) is answered it, one that
+/// presents another key is told the patch is not ready, and one with no key
+/// is answered the registry of the ruby gem alone, with no list.
+async fn mount_api_rebuilding(server: &MockServer, current: (&[Listed], u32)) {
     let api = server.uri();
-    let holding = json!({ "gemBuilds": true, "gemSnapshotKeys": { UUID: held.1.to_string() } });
-    Mock::given(method("POST"))
-        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+    let package =
+        || Mock::given(method("POST")).and(path(format!("/v0/orgs/{ORG}/patches/package")));
+    let holding = json!({ "gemBuilds": true, "gemSnapshotKeys": { UUID: current.1.to_string() } });
+    package()
         .and(body_partial_json(holding))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "results": { UUID: reference(&api, UUID, Some(held)) }
+            "results": { UUID: reference(&api, UUID, Some(current)) }
         })))
         .with_priority(1)
         .mount(server)
         .await;
-    mount_api(server, Some(current)).await;
+    package()
+        .and(|request: &wiremock::Request| {
+            serde_json::from_slice::<Value>(&request.body)
+                .is_ok_and(|body| body["gemSnapshotKeys"][UUID].is_string())
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": { UUID: {
+                "status": "pending_build", "url": null, "purl": null, "artifacts": [],
+                "registryOverride": null,
+            }}
+        })))
+        .with_priority(2)
+        .mount(server)
+        .await;
+    mount_api(server, None).await;
 }
 
 /// The bodies of the package reference requests `server` got.
@@ -773,8 +784,8 @@ async fn a_patch_with_no_list_leaves_the_gem_alone_with_a_warning() {
     let detail = env["warnings"][0]["detail"].as_str().unwrap();
     assert!(
         detail.contains(
-            "the patch covers the ruby platform gem only (the patch registry does not list the \
-             platform gems of this version)"
+            "the patch service names no platform gem of this version right now (its answer is \
+             the registry of the ruby platform gem alone)"
         ),
         "{detail}"
     );
@@ -4271,12 +4282,11 @@ async fn a_lock_on_its_patch_whose_platform_the_list_no_longer_names_is_reported
 }
 
 /// The patch service builds a patched gem again while a lock is pinned to
-/// it. The registry as it stands lists upstream's gem for that platform,
-/// except for a client that presents the key of the listing it already
-/// holds: the scan of such a lock sends the key its registry URL names
-/// and is answered that listing. So nothing changes, the gem is reported as on its patch, with
-/// nothing left to patch, and `vex` still attests the installed patched
-/// build.
+/// it. Its registry lists what it listed, and answers it to a client that
+/// presents its key: the scan of such a lock sends the key its registry
+/// URL names. So nothing changes, the gem is reported as on its patch,
+/// with nothing left to patch, and `vex` still attests the installed
+/// patched build.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_lock_on_its_patch_presents_its_snapshot_while_a_build_is_rebuilt() {
     let patched = b"module PlatformProbe\n  FIXED = true\nend\n";
@@ -4336,7 +4346,7 @@ async fn a_lock_on_its_patch_presents_its_snapshot_while_a_build_is_rebuilt() {
     // The linux build is being built again.
     server.reset().await;
     build_record().mount(&server).await;
-    mount_api_rebuilding(&server, (&ONE_PATCHED[..], 4), (&NONE_PATCHED[..], 5)).await;
+    mount_api_rebuilding(&server, (&ONE_PATCHED[..], 4)).await;
     let (code, env) = scan_json(proj.path(), &api, &[]);
     assert_eq!(code, 0, "{env}");
     assert_eq!(pair(), pinned, "the pair is left as it is");
@@ -4369,30 +4379,32 @@ async fn a_lock_on_its_patch_presents_its_snapshot_while_a_build_is_rebuilt() {
     );
 }
 
-/// A client that presents no snapshot is answered the registry as it
-/// stands, with upstream's own gem for the build that is being rebuilt: a
-/// project whose lock is not on the patch's registry has none to present.
-/// Its request names no key. With no locked build patched in that
-/// listing, the gem is left on its upstream registry, quietly, and moves
-/// on a later run.
+/// A client that presents no snapshot is answered the registry of the
+/// ruby gem alone, with no list, as a client that asks for none is: a
+/// project whose lock is not on the patch's registry has no key to present.
+/// Its request names none. Its lock names platform builds, which that
+/// registry does not serve, so the gem is left on its upstream registry,
+/// with the warning that says the service names no platform gem right now,
+/// and moves on a run after the rebuild.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_lock_that_holds_no_snapshot_gets_the_current_listing_while_a_build_is_rebuilt() {
+async fn a_lock_that_holds_no_snapshot_is_left_alone_while_a_build_is_rebuilt() {
     let server = MockServer::start().await;
-    mount_api_rebuilding(&server, (&ONE_PATCHED[..], 4), (&NONE_PATCHED[..], 5)).await;
+    mount_api_rebuilding(&server, (&ONE_PATCHED[..], 4)).await;
     let proj = project(&lock(true));
     let api = server.uri();
     let (code, env) = scan_json(proj.path(), &api, &[]);
     assert_eq!(code, 0, "{env}");
     assert_eq!(read(proj.path(), "Gemfile.lock"), lock(true));
     assert_eq!(read(proj.path(), "Gemfile"), GEMFILE);
-    let codes: Vec<&str> = env["events"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|event| event["errorCode"].as_str())
-        .collect();
-    assert_eq!(codes, ["redirect_gem_no_patched_build"], "{env}");
-    assert_eq!(warning_codes(&env), Vec::<String>::new(), "{env}");
+    assert_eq!(
+        warning_codes(&env),
+        ["redirect_gem_platform_unsupported"],
+        "{env}"
+    );
+    assert!(
+        env["warnings"].to_string().contains("right now"),
+        "the warning says it is the state of the service: {env}"
+    );
     let bodies = reference_bodies(&server).await;
     assert!(
         !bodies.is_empty()
@@ -4401,10 +4413,125 @@ async fn a_lock_that_holds_no_snapshot_gets_the_current_listing_while_a_build_is
                 .all(|body| body.get("gemSnapshotKeys").is_none()),
         "a request with no snapshot to present is the request it always was: {bodies:?}"
     );
+
+    // After the rebuild the gem moves.
+    server.reset().await;
+    mount_api(&server, Some((&ONE_PATCHED[..], 4))).await;
+    let (code, env) = scan_json(proj.path(), &api, &[]);
+    assert_eq!(code, 0, "{env}");
+    let index = format!("{}/", index_url(&api, Some(4)));
+    assert_eq!(
+        read(proj.path(), "Gemfile.lock"),
+        hosted_lock(&index, ARM_UPSTREAM, LINUX_PATCHED)
+    );
+}
+
+/// A lock on an earlier snapshot of its patch, in which both builds were
+/// patched. Since then the `arm64-darwin` build was withdrawn, and the
+/// `x86_64-linux-gnu` build is being built again. The registry as it
+/// stands has another key, so the service tells this lock the patch is not
+/// ready: nothing is rewritten, and no build is reported as withdrawn or
+/// put back on upstream's gem while the service cannot say what the
+/// rebuilt one will be. The first run after the rebuild moves the lock
+/// once: upstream's gem back for the withdrawn build, the rebuilt one
+/// pinned as it was.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lock_on_an_earlier_snapshot_waits_out_a_rebuild_and_then_moves_once() {
+    let server = MockServer::start().await;
+    let api = server.uri();
+    let earlier = format!("{}/", index_url(&api, Some(4)));
+    let proj = hosted_project(&earlier, ARM_PATCHED, LINUX_PATCHED, true);
+    let pair = || {
+        (
+            read(proj.path(), "Gemfile.lock"),
+            read(proj.path(), "Gemfile"),
+        )
+    };
+    let pinned = pair();
+
+    mount_api_rebuilding(&server, (&ONE_PATCHED[..], 6)).await;
+    let (code, env) = scan_json(proj.path(), &api, &[]);
+    assert_eq!(code, 0, "{env}");
+    assert_eq!(pair(), pinned, "the pair is left as it is");
+    let said = env.to_string();
+    assert!(
+        said.contains("pending_build") && !said.contains("withdrawn"),
+        "the patch is still being built, and nothing is called withdrawn: {env}"
+    );
+    assert_eq!(warning_codes(&env), Vec::<String>::new(), "{env}");
+    let bodies = reference_bodies(&server).await;
+    assert!(
+        !bodies.is_empty()
+            && bodies
+                .iter()
+                .all(|body| body["gemSnapshotKeys"] == json!({ UUID: "4" })),
+        "every reference request presents the snapshot the lock is on: {bodies:?}"
+    );
     let (code, stdout, stderr) = hosted(proj.path(), &api, &["scan"], &[]);
     assert_eq!(code, 0, "{stdout}\n{stderr}");
     assert!(
-        (stdout + &stderr).contains("no patched build yet"),
-        "the gem is reported as not patched yet"
+        (stdout + &stderr).contains("still being built"),
+        "a person is told to run it again later"
+    );
+    assert_eq!(pair(), pinned);
+
+    // The rebuild is over, with the bytes the build had.
+    server.reset().await;
+    mount_api(&server, Some((&ONE_PATCHED[..], 6))).await;
+    let (code, env) = scan_json(proj.path(), &api, &[]);
+    assert_eq!(code, 0, "{env}");
+    let now = format!("{}/", index_url(&api, Some(6)));
+    assert_eq!(
+        read(proj.path(), "Gemfile.lock"),
+        hosted_lock(&now, ARM_UPSTREAM, LINUX_PATCHED),
+        "{env}"
+    );
+    assert!(
+        hosted_events(&env).contains(&withdrawn_event(ARM)),
+        "the withdrawn build is said to be back on upstream's gem: {env}"
+    );
+}
+
+/// A project with both spellings of the Bundler pair, each lock on another
+/// snapshot of the patch. Bundler reads `gems.rb` and `gems.locked` there,
+/// and so does the rewriter: the key every reference request presents is
+/// the one `gems.locked` names, never the stale `Gemfile.lock`'s.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_key_presented_is_the_one_of_the_lock_the_run_rewrites() {
+    let server = MockServer::start().await;
+    let api = server.uri();
+    mount_api(&server, Some((&ONE_PATCHED[..], 4))).await;
+    let current = format!("{}/", index_url(&api, Some(4)));
+    let stale = format!("{}/", index_url(&api, Some(9)));
+    let proj = hosted_project(&stale, ARM_UPSTREAM, LINUX_PATCHED, true);
+    let write = |rel: &str, text: String| std::fs::write(proj.path().join(rel), text).unwrap();
+    write("gems.rb", hosted_gemfile(&current));
+    write(
+        "gems.locked",
+        hosted_lock(&current, ARM_UPSTREAM, LINUX_PATCHED),
+    );
+    let (code, env) = scan_json(proj.path(), &api, &[]);
+    assert_eq!(code, 0, "{env}");
+    let bodies = reference_bodies(&server).await;
+    assert!(
+        !bodies.is_empty()
+            && bodies
+                .iter()
+                .all(|body| body["gemSnapshotKeys"] == json!({ UUID: "4" })),
+        "the snapshot of gems.locked is presented: {bodies:?}"
+    );
+
+    // Without a gems.rb the pair is Gemfile and Gemfile.lock.
+    std::fs::remove_file(proj.path().join("gems.rb")).unwrap();
+    std::fs::remove_file(proj.path().join("gems.locked")).unwrap();
+    server.reset().await;
+    mount_api(&server, Some((&ONE_PATCHED[..], 4))).await;
+    let (code, env) = scan_json(proj.path(), &api, &[]);
+    assert_eq!(code, 0, "{env}");
+    let first = reference_bodies(&server).await;
+    assert_eq!(
+        first.first().map(|body| &body["gemSnapshotKeys"]),
+        Some(&json!({ UUID: "9" })),
+        "{first:?}"
     );
 }

@@ -4892,7 +4892,7 @@ wire is skipped, neither file changes for it, and the warning says why and what 
 | `redirect_gem_declaration_not_visible` | the lock lists it as a direct dependency, but it is declared where the scan cannot edit: an `eval_gemfile`d file, a loop, a gemspec. Declare it with a literal `gem "<name>"` line in the Gemfile, in place of any other `gem` call that declares it (a gemspec's development dependency stays), or patch it with `--mode agent`. Vendored mode refuses it for the same reason. |
 | `redirect_gem_dependency_not_locked` | the Gemfile declares it and the lock's `DEPENDENCIES` does not list it. Run `bundle lock` and re-run. |
 | `redirect_gem_lock_unconvergeable` | the lock cannot be brought in line with the Gemfile: it has no `BUNDLED WITH` section to say which layout its Bundler accepts, or a Bundler < 2.2 lock lists its sources in an order the Gemfile's `source` lines do not explain. Run `bundle lock` with your current Bundler and re-run. Also a Gemfile with more than one top-level `source` line: Bundler 2.2 to 2.7 lock all its gems in one `GEM` section that names every source, which hosted mode does not rewrite, and `bundle lock` writes the same lock again. Keep the source that serves the gem as the one top-level `source` and move each other one into a `source "<url>" do … end` block around the gems that come from it (Bundler's own deprecation warning asks for the same), then run `bundle lock` and re-run; or use `--mode agent`. A Bundler 2.2 release before 2.2.25 keeps the one section even then, so run that `bundle lock` with a later Bundler; the warning says so when the lock was written by one. |
-| `redirect_gem_platform_unsupported` | the lock holds platform-specific builds of the gem (`nokogiri (1.18.10-x86_64-linux-gnu)`) and the patch covers the ruby gem alone, or the lock is the merged layout of a Bundler older than 2.2. The warning names the builds the lock holds and which of the two it is. See "Precompiled platform gems" below. |
+| `redirect_gem_platform_unsupported` | the lock holds platform-specific builds of the gem (`nokogiri (1.18.10-x86_64-linux-gnu)`) and the patch service names no platform gem of the version right now (also its answer, for the length of a rebuild, to a project that is not on the patch yet), or the lock is the merged layout of a Bundler older than 2.2. The warning names the builds the lock holds and which of the two it is. See "Precompiled platform gems" below. |
 
 `--mode agent` can still patch a gem hosted mode skips. `--mode vendored` can too, unless it
 refuses the gem itself (see "Ruby gems: gems vendored mode refuses").
@@ -4953,14 +4953,16 @@ For a platform the registry lists no gem for (one upstream does not publish), a 
 nothing, and the statement says so: the build is settled once the lock no longer names the
 platform (`bundle lock --remove-platform`).
 
-While the patch service builds a patched gem again (a rebuild of a published build), the registry
-as it stands lists upstream's own gem for that platform. A project whose lock is already on the
-patch is not affected: its scan and `vex` present the key of the snapshot the lock names, and are
-answered that snapshot as it was, so the scan reports the gem as already on its patch and `vex`
-attests its builds. A project that is not on the patch yet is answered the registry as it stands,
-and takes the patched build on a later run. During the rebuild a fresh `bundle install` of that
-platform's gem from the earlier snapshot fails until the rebuilt gem is there, as for any gem
-that is briefly unavailable.
+While the patch service builds a patched gem again (a rebuild of a published build), its registry
+lists what it listed. A project whose lock is already on the patch is not affected: its scan and
+`vex` present the key of the snapshot the lock names, and are answered that snapshot, so the
+scan reports the gem as already on its patch and `vex` attests its builds. A lock on an earlier
+snapshot of the patch is told the patch is still being built and is left as it is; the first scan
+after the rebuild moves it. A project that is not on the patch yet is left on its upstream
+registry and takes the patched build on a scan after the rebuild. A vendored copy is not touched
+by a rebuild either: a re-scan, `repair` and `vendor --check` find it as it was. During the
+rebuild a fresh `bundle install` of that platform's gem from the snapshot fails until the rebuilt
+gem is there, as for any gem that is briefly unavailable.
 
 When upstream stops publishing a platform gem that a lock names, the patch registry no longer
 lists that platform. The scan then leaves the gem as it is and says so
@@ -5045,8 +5047,10 @@ A gem the lock names as its plain `nokogiri (1.18.10)` entry alone is not affect
 its registry URL has no `/s/<key>/` level, and a project pinned by an earlier release sees no
 change.
 
-The gem is skipped with the warning `redirect_gem_platform_unsupported` only when the patch covers
-the ruby gem alone, or the lock is the merged layout of a Bundler older than 2.2.
+The gem is skipped with the warning `redirect_gem_platform_unsupported` only when the patch
+service names no platform gem of the version (it has not read them yet, or is building a gem of
+the patch again while the project is not on the patch), or the lock is the merged layout of a
+Bundler older than 2.2.
 
 **Undoing it.** `rollback` and `remove` take the option (or the added line) off again and
 restore the lock: the pair is the pre-scan pair byte for byte, with LF or CRLF line endings.

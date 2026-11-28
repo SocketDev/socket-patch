@@ -278,11 +278,11 @@ pub(crate) struct PackageVendorRequest {
     /// always has, with the ruby gem's registry alone, so every reference
     /// request of this CLI carries it: [`Self::new`].
     pub gem_builds: bool,
-    /// The registry snapshot the project's Bundler lock already takes a
-    /// gem from, by patch uuid: its key. The service reads it only while
-    /// a gem of that snapshot is being built again, and then answers the
-    /// snapshot the lock holds where it would say the patch is not ready.
-    /// Left out of a request that presents none.
+    /// The registry snapshot the project's Bundler lock takes a gem from,
+    /// by patch uuid: its key
+    /// ([`GemSnapshotKeys`](crate::api::client::GemSnapshotKeys), which
+    /// says what the service does with it). Left out of a request that
+    /// presents none.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub gem_snapshot_keys: std::collections::BTreeMap<String, String>,
 }

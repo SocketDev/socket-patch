@@ -672,6 +672,20 @@ class NokogiriE2E
       code, stdout, stderr, = sp_service("vex", "--product", PRODUCT, "--output", File.join(@proj, "vex.json"))
       check(code.zero? && vex_statement["status"] == "not_affected" && !(stdout + stderr).include?("as affected"),
             "and `vex` still attests the patch", "exit #{code}\n#{tail(stdout)}#{tail(stderr)}")
+      # What the service answers a client that is not on that snapshot.
+      asked = lambda do |keys|
+        body = { "uuids" => [UUID], "gemBuilds" => true }
+        body["gemSnapshotKeys"] = keys if keys
+        reply = Net::HTTP.post(URI("#{service.url}/v0/orgs/#{PatchService::ORG}/patches/package"), JSON.generate(body),
+                               "Content-Type" => "application/json")
+        JSON.parse(reply.body).fetch("results").fetch(UUID)
+      end
+      keyless = asked.call(nil)
+      check(keyless["status"] == "granted" && !keyless["registryOverride"]["indexUrl"].include?("/s/") &&
+            !keyless["registryOverride"]["identifiers"].key?("gemBuilds"),
+            "a request with no key is answered the plain registry and no list", keyless.inspect)
+      check(asked.call(UUID => "0" * 12)["status"] == "pending_build",
+            "and one that presents another key is told the patch is not ready")
       service.rebuilt(own_platform)
     end
 

@@ -9836,8 +9836,8 @@ fn rewrite_gem(
                 let no_list = ov.identifiers.gem_builds.is_none();
                 if no_list || merged {
                     let why = if no_list {
-                        "the patch covers the ruby platform gem only (the patch registry does \
-                         not list the platform gems of this version)"
+                        "the patch service names no platform gem of this version right now \
+                         (its answer is the registry of the ruby platform gem alone)"
                     } else {
                         "its bundler (< 2.2) lists every gem source in one GEM section, where \
                          socket-patch redirects only a ruby platform gem"
@@ -24148,8 +24148,8 @@ mod tests {
         assert_eq!(warning.code, "redirect_gem_platform_unsupported");
         assert!(
             warning.detail.ends_with(
-                "the patch covers the ruby platform gem only (the patch registry does not list \
-                 the platform gems of this version); redirect skipped"
+                "the patch service names no platform gem of this version right now (its answer \
+                 is the registry of the ruby platform gem alone); redirect skipped"
             ),
             "{}",
             warning.detail

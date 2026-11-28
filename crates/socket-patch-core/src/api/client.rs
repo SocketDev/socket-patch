@@ -1330,11 +1330,10 @@ impl ApiClient {
     /// Returns a UUID → reference map (missing/404 → empty).
     ///
     /// `gem_snapshots` are the registry snapshots the project's Bundler
-    /// lock already takes gems from ([`GemSnapshotKeys`]): a request about
-    /// one of those patches presents its key, and the patch service then
-    /// answers the listing the lock holds while a gem of it is being built
-    /// again. The key changes no other answer. A caller with no lock to
-    /// read passes an empty map.
+    /// lock takes gems from ([`GemSnapshotKeys`]), which the request
+    /// presents for the patches it asks about; what the patch service
+    /// does with a key is said there. A caller with no lock to read
+    /// passes an empty map.
     pub async fn fetch_registry_references(
         &self,
         uuids: &[String],
@@ -3533,10 +3532,19 @@ pub enum ApiError {
 pub type ApiFuture<'a, T> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, ApiError>> + Send + 'a>>;
 
-/// The registry snapshots a Bundler lock already takes gems from, by patch
-/// uuid: the key each such remote names
-/// ([`crate::patch::redirect::gem_lock_snapshot_keys`]), a short string of
-/// lowercase hexadecimal digits.
+/// The registry snapshots a Bundler lock takes gems from, by patch uuid:
+/// the key each such remote names
+/// ([`crate::patch::redirect::gem_project_snapshot_keys`]), a short string
+/// of lowercase hexadecimal digits.
+///
+/// A reference request presents the key of each patch it asks about
+/// (`gemSnapshotKeys`). The patch service reads a key only while a gem
+/// that patch's registry lists is being built again. A request whose key
+/// is the key of the registry as it stands is then answered that registry,
+/// so the lock is left as it is. One that presents another key is told the
+/// patch is not ready (`pending_build`). One with no key is answered as a
+/// client that asks for no list is: the ruby gem's registry alone.
+/// Outside a rebuild the key changes no answer.
 pub type GemSnapshotKeys = std::collections::BTreeMap<String, String>;
 
 /// The entries of `held` for the patches `uuids` (in any case): what one
@@ -3571,9 +3579,8 @@ pub trait PatchApi: Send + Sync {
 
     /// `POST …/patches/package` (hosted reference grants), keyed by uuid.
     /// `gem_snapshots` are the registry snapshots the project's Bundler
-    /// lock already takes gems from ([`GemSnapshotKeys`]), which a host
-    /// that asks for a gem's listing presents with the request; a host
-    /// that asks for none has nothing to do with them.
+    /// lock takes gems from ([`GemSnapshotKeys`]): a host passes the
+    /// entries for `uuids` on with its request.
     fn fetch_registry_references<'a>(
         &'a self,
         uuids: &'a [String],
