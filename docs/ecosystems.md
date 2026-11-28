@@ -4943,12 +4943,11 @@ package, against the record of that build's own patch: one more request per inst
 build, whichever gem homes hold it. A platform gem is a patch of its own, whose files carry that
 patch's header (and, for a compiled build, its binaries), so they are never checked against the
 gem's patch. Every copy has to verify; one that does not leaves the build out of the document.
-If that record cannot be read, the build is stated as `affected` under `vex_gem_build_unknown`,
-like a build the lock cannot be shown to install. The scan's own `--vex` holds a build to the
-same check.
-When it cannot show that (`--offline`, a failed
-request, a lock older than what the patch service lists now) it states the build as `affected`,
-with what to run to settle it, under the warning `vex_gem_build_unknown`. The run still succeeds.
+The scan's own `--vex` holds a build to the same check.
+When `vex` cannot show what the lock installs for a build (`--offline`, a failed request, a lock
+older than what the patch service lists now), or cannot read the record of an installed build's
+patch, it states the build as `affected`, with what to run to settle it, under the warning
+`vex_gem_build_unknown`. The run still succeeds.
 For a platform the registry lists no gem for (one upstream does not publish), a scan changes
 nothing, and the statement says so: the build is settled once the lock no longer names the
 platform (`bundle lock --remove-platform`).
@@ -4965,7 +4964,7 @@ that is damaged or missing cannot be restored until the rebuild is over: the run
 patch service lists no builds for the gem right now, and to run it again later. A project that
 is not vendored yet, or whose lock gained a platform, is left as it is for the length of the
 rebuild (exit 0): `nokogiri@1.18.10 is not vendored: the patch service lists no builds for it
-right now; run the scan again later.` During the
+right now. Run this again later.` During the
 rebuild a fresh `bundle install` of that platform's gem from the snapshot fails until the rebuilt
 gem is there, as for any gem that is briefly unavailable.
 
@@ -5235,7 +5234,7 @@ How each mode gets the patched code running:
 | Mode | What happens |
 |---|---|
 | Hosted | Bundler installs the patched `.gem` from the patch registry, and RubyGems compiles it like any registry gem. A gem the lock pins as precompiled platform gems (`x86_64-linux-gnu`) is installed through the patch registry with nothing to compile: the patched platform gem where the platform has one, upstream's own gem where it has none yet. The gem moves as soon as one locked platform has a patched build, and the run names the platforms that are patched and the ones that keep upstream's gem. |
-| Vendored | A gem `Gemfile.lock` pins as precompiled platform gems (one entry per platform, such as `nokogiri (1.18.10-x86_64-linux-gnu)`) is vendored from patched platform gems. Each platform has a patch of its own, and the vendored directory holds each platform's patched gem unpacked (`<name>-<version>/<platform>/`), so Bundler loads the one for the platform it runs on and builds nothing. Every platform in the lock needs a patched build. While one has none the gem is not vendored: one line (`vendor_prebuilt_platform_pending`) names the platforms without a patched build and says that hosted mode can patch the others now. A dry run says the same. The run does not fail, nothing is written, a copy that is already vendored stays in place, and a later run vendors the gem once every platform has a patched build. A lock that also holds the plain `nokogiri (1.18.10)` entry of the `ruby` platform is refused with `platform_gem_unsupported`, and so is a lock written by a Bundler older than 2.3 (its `BUNDLED WITH`), the oldest version the layout is verified on. The vendored directory carries its own `.gitignore` and `.gitattributes`, so a project rule such as `*.so` or a Git LFS filter does not keep the binaries out of the commit or change their bytes. Bundler cannot add a platform the vendored directory has no gem for: to add one later, revert the gem (`vendor --revert`), run `bundle lock --add-platform <platform>` and vendor again. A gem with a native extension that is locked for the `ruby` platform alone is refused (`native_extensions_unsupported`, or `platform_gem_unsupported` when the installed copy is a precompiled one): Bundler builds no extensions for path-sourced gems. Use hosted or agent mode for that gem. |
+| Vendored | A gem `Gemfile.lock` pins as precompiled platform gems (one entry per platform, such as `nokogiri (1.18.10-x86_64-linux-gnu)`) is vendored from patched platform gems. Each platform has a patch of its own, and the vendored directory holds each platform's patched gem unpacked (`<name>-<version>/<platform>/`), so Bundler loads the one for the platform it runs on and builds nothing. Every platform in the lock needs a patched build. While one has none the gem is not vendored: one line (`vendor_prebuilt_platform_pending`) names the platforms without a patched build and says that hosted mode can patch the others now. A platform the patch registry does not list (one upstream does not publish) is named as such, with what settles it (`bundle lock --remove-platform`), and neither mode patches the gem until then. While the patch service lists no builds for the gem at all (it has not read the version's gems yet, or is building one of them again), the line names no platform and says to run again later. A dry run says the same. The run does not fail, nothing is written, a copy that is already vendored stays in place, and a later run vendors the gem once every platform has a patched build. A lock that also holds the plain `nokogiri (1.18.10)` entry of the `ruby` platform is refused with `platform_gem_unsupported`, and so is a lock written by a Bundler older than 2.3 (its `BUNDLED WITH`), the oldest version the layout is verified on. The vendored directory carries its own `.gitignore` and `.gitattributes`, so a project rule such as `*.so` or a Git LFS filter does not keep the binaries out of the commit or change their bytes. Bundler cannot add a platform the vendored directory has no gem for: to add one later, revert the gem (`vendor --revert`), run `bundle lock --add-platform <platform>` and vendor again. A gem with a native extension that is locked for the `ruby` platform alone is refused (`native_extensions_unsupported`, or `platform_gem_unsupported` when the installed copy is a precompiled one): Bundler builds no extensions for path-sourced gems. Use hosted or agent mode for that gem. |
 | Agent (`apply`) | The extension is rebuilt from the gem's source archive with the patch laid over it, using RubyGems' builder and the Ruby that owns the install, and the build is put where Ruby loads it: the extension directory of a gem RubyGems built, the prebuilt binary of a precompiled gem. |
 
 `apply` takes the source gem (`<name>-<version>.gem`) from the gem home's `cache/` directory,
