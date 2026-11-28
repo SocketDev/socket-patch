@@ -2136,7 +2136,7 @@ async fn resolve_hosted_gems(
 /// lock does not pin every build ([`PendingGem::needs_index`]). No patch
 /// record is read here: the record of a platform build's own patch is
 /// read only for a build that has an installed copy
-/// ([`read_build_record`]).
+/// ([`read_build_records`]).
 async fn read_gem_builds(
     common: &GlobalArgs,
     api_client: &RunApiClient,
@@ -2236,12 +2236,15 @@ async fn read_gem_builds(
 /// per patch, asked without file contents, several at a time, with the
 /// stale-credential fallback of the other reads: a patch the
 /// authenticated API refuses (401/403) is asked of the public proxy, and
-/// `notes` says so once. `Err` says why a record could not be read, safe
-/// to print: nothing then judges that build's copies.
+/// `notes` says so once. `fell_back`: an earlier read of this run was
+/// refused that way and said so, so every record is asked of the proxy
+/// from the start. `Err` says why a record could not be read, safe to
+/// print: nothing then judges that build's copies.
 pub(crate) async fn read_build_records(
     common: &GlobalArgs,
     api_client: &RunApiClient,
     uuids: &[String],
+    fell_back: bool,
     notes: &mut Vec<PlanNote>,
 ) -> Vec<Result<HashMap<String, PatchFileInfo>, GemBuildUnshown>> {
     use socket_patch_core::utils::redact::redact_urls_in;
@@ -2264,7 +2267,10 @@ pub(crate) async fn read_build_records(
         .collect::<Vec<_>>()
         .await
     };
-    let client = run_client(common, api_client, notes).await;
+    let client = match fell_back {
+        true => build_proxy_fallback_client(&common.api_client_overrides()),
+        false => run_client(common, api_client, notes).await,
+    };
     let on_proxy = client.uses_public_proxy();
     let mut reads = summaries(client, uuids.to_vec()).await;
     let refused = |read: &Result<_, socket_patch_core::api::client::ApiError>| matches!(read, Err(e) if is_fallback_candidate(e));
@@ -2302,7 +2308,7 @@ pub(crate) async fn read_build_records(
 }
 
 /// The [`GEM_BUILD_UNKNOWN`] warning of a patched build of the gem at
-/// `key` whose installed copy nothing could judge ([`read_build_record`]).
+/// `key` whose installed copy nothing could judge ([`read_build_records`]).
 pub(crate) fn unjudged_build_note(
     key: &str,
     gem_fix: &str,
@@ -2602,6 +2608,63 @@ mod tests {
             fallback.detail
         );
         assert!(out.contains_key(U1) && out.contains_key(U2), "{out:?}");
+    }
+
+    /// A run whose earlier read was refused by the authenticated API asks
+    /// the public proxy for the records of its builds from the start: the
+    /// authenticated API gets no request, and nothing is noted again.
+    #[tokio::test]
+    async fn build_records_stay_on_the_proxy_once_a_run_fell_back() {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let api = MockServer::start().await;
+        let proxy = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/patch/view/{U1}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "uuid": U1,
+                "purl": "pkg:gem/nokogiri@1.18.10?platform=arm64-darwin",
+                "publishedAt": "2026-01-01T00:00:00Z",
+                "files": { "lib/a.rb": { "beforeHash": "b".repeat(64), "afterHash": "a".repeat(64) } },
+                "vulnerabilities": {},
+                "description": "",
+                "license": "MIT",
+                "tier": "free",
+            })))
+            .mount(&proxy)
+            .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let common = GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            json: true,
+            api_url: Some(api.uri()),
+            api_token: Some("sktsec_placeholder_value_for_tests_api".into()),
+            org: Some("acme".into()),
+            proxy_url: Some(proxy.uri()),
+            ..GlobalArgs::default()
+        };
+        let uuids = [U1.to_string()];
+        let mut notes: Vec<PlanNote> = Vec::new();
+        let read =
+            read_build_records(&common, &RunApiClient::new(), &uuids, true, &mut notes).await;
+        let [Ok(files)] = read.as_slice() else {
+            panic!("the record is read: {read:?}");
+        };
+        assert!(files.contains_key("lib/a.rb"), "{files:?}");
+        assert!(notes.is_empty(), "{notes:?}");
+        let asked = api.received_requests().await.unwrap_or_default();
+        assert!(
+            asked.is_empty(),
+            "the refused API is not asked again: {asked:?}"
+        );
+
+        // A run that has not fallen back asks the authenticated API first.
+        let read =
+            read_build_records(&common, &RunApiClient::new(), &uuids, false, &mut notes).await;
+        assert!(matches!(read.as_slice(), [Ok(_)] | [Err(_)]), "{read:?}");
+        let asked = api.received_requests().await.unwrap_or_default();
+        assert!(!asked.is_empty(), "the authenticated API is asked first");
     }
 
     /// Standalone `vex --json` (no host client): a token whose org cannot
