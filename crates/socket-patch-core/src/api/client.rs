@@ -1773,18 +1773,23 @@ impl ApiClient {
     /// artifacts itself learns here which exist. Same grant, statuses,
     /// retry ladder and circuit breaker as the full fetch; a uuid the
     /// attached plan names is answered from its reference batch.
+    ///
+    /// `gem_snapshot` is the registry snapshot a vendor ledger entry
+    /// records for the gem ([`GemSnapshotKeys`]): the request presents it,
+    /// in a request of its own (the plan's batch presents none).
     pub(crate) async fn fetch_vendor_reference(
         &self,
         uuid: &str,
         free_only: bool,
         vendor_url: Option<&str>,
         patch_server_url: Option<&str>,
+        gem_snapshot: Option<&str>,
     ) -> VendorServiceOutcome<VendorReference> {
         if let Some(refused) = self.vendor_request_refused(uuid) {
             return VendorServiceOutcome::Failed(refused);
         }
         let (outcome, retryable_failure) = match self
-            .request_vendor_package(uuid, free_only, vendor_url)
+            .request_vendor_package(uuid, free_only, vendor_url, gem_snapshot)
             .await
         {
             Ok(result) => (vendor_reference(&result, patch_server_url), false),
@@ -1814,7 +1819,7 @@ impl ApiClient {
         let mut results = std::collections::HashMap::new();
         for chunk in uuids.chunks(MAX_REFERENCE_BATCH) {
             match self
-                .request_vendor_references(chunk, free_only, vendor_url)
+                .request_vendor_references(chunk, free_only, vendor_url, &GemSnapshotKeys::new())
                 .await
             {
                 Ok(answered) => results.extend(answered),
@@ -1918,7 +1923,7 @@ impl ApiClient {
 
         // ── Step 1: resolve the grant URL + integrity ──────────────────────
         let result = match self
-            .request_vendor_package(uuid, free_only, vendor_url)
+            .request_vendor_package(uuid, free_only, vendor_url, None)
             .await
         {
             Ok(r) => r,
@@ -2049,19 +2054,26 @@ impl ApiClient {
         uuid: &str,
         free_only: bool,
         vendor_url: Option<&str>,
+        gem_snapshot: Option<&str>,
     ) -> Result<PackageVendorResult, (ApiError, bool)> {
         let plan = self
             .vendor_prefetch
             .lock()
             .ok()
             .and_then(|slot| slot.clone());
-        if let Some(plan) = plan {
+        // The plan's batch presents no snapshot, so a request that has one
+        // to present is asked on its own.
+        if let (Some(plan), None) = (plan, gem_snapshot) {
             if let Some(result) = plan.reference(self, uuid, free_only, vendor_url).await {
                 return result;
             }
         }
+        let held = gem_snapshot
+            .map(|key| (uuid.to_string(), key.to_string()))
+            .into_iter()
+            .collect();
         let mut results = self
-            .request_vendor_references(&[uuid.to_string()], free_only, vendor_url)
+            .request_vendor_references(&[uuid.to_string()], free_only, vendor_url, &held)
             .await?;
         results.remove(uuid).ok_or_else(|| {
             (
@@ -2080,12 +2092,13 @@ impl ApiClient {
         uuids: &[String],
         free_only: bool,
         vendor_url: Option<&str>,
+        gem_snapshots: &GemSnapshotKeys,
     ) -> Result<std::collections::HashMap<String, PackageVendorResult>, (ApiError, bool)> {
         self.retry_vendor(
             VENDOR_REFERENCES_KEY,
             "vendor package request",
             None,
-            || self.request_vendor_references_once(uuids, free_only, vendor_url),
+            || self.request_vendor_references_once(uuids, free_only, vendor_url, gem_snapshots),
         )
         .await
     }
@@ -2096,10 +2109,11 @@ impl ApiClient {
         uuids: &[String],
         free_only: bool,
         vendor_url: Option<&str>,
+        gem_snapshots: &GemSnapshotKeys,
     ) -> Result<std::collections::HashMap<String, PackageVendorResult>, VendorAttemptError> {
-        // A vendored lock takes the gem from a path: it has no registry
-        // snapshot to present.
-        let body = PackageVendorRequest::new(uuids, free_only, GemSnapshotKeys::new());
+        // A vendored lock takes the gem from a path, so the snapshot to
+        // present is the one its ledger entry records, where it has one.
+        let body = PackageVendorRequest::new(uuids, free_only, gem_snapshots.clone());
         let (url, use_auth) = self.vendor_package_url(vendor_url);
         debug_log(&format!("POST {url}"));
 
@@ -2605,6 +2619,9 @@ pub(crate) struct VendorReference {
     /// serves them (`registryOverride.identifiers.gemBuilds`); `None` when
     /// the reference carries no list.
     pub gem_builds: Option<Vec<crate::patch::redirect::GemPlatformChecksum>>,
+    /// gem: the key of the registry snapshot that list is served under
+    /// (`registryOverride.indexUrl`); `None` for a registry with no list.
+    pub gem_snapshot: Option<String>,
 }
 
 /// Outcome of [`ApiClient::fetch_vendor_package`], and, with the
@@ -2655,14 +2672,16 @@ fn vendor_reference(
     if let Some(miss) = reference_miss(&result.status) {
         return miss;
     }
-    let gem_builds = result
-        .registry_override
-        .as_ref()
-        .and_then(|registry| registry.identifiers.gem_builds.clone());
+    let registry = result.registry_override.as_ref();
+    let gem_builds = registry.and_then(|registry| registry.identifiers.gem_builds.clone());
+    let gem_snapshot = registry
+        .and_then(|registry| crate::patch::redirect::split_gem_snapshot(&registry.index_url).1)
+        .map(str::to_string);
     VendorServiceOutcome::Ready(VendorReference {
         archive: served_artifacts(result, patch_server_url, true).pop(),
         secondary: served_secondary_artifacts(result, patch_server_url),
         gem_builds,
+        gem_snapshot,
     })
 }
 
@@ -5557,6 +5576,39 @@ mod vendor_package_tests {
 
     // ── fetch_vendor_reference(s) (a gem's platform builds) ────────────
 
+    /// A restore presents the registry snapshot its ledger entry records,
+    /// in a request of its own; a request with none to present names none.
+    #[tokio::test]
+    async fn a_vendor_reference_request_presents_the_snapshot_it_is_given() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": { UUID: { "status": "pending_build" } }
+            })))
+            .mount(&server)
+            .await;
+        let client = auth_client(server.uri());
+        for held in [Some("9f3c01"), None] {
+            let outcome = client
+                .fetch_vendor_reference(UUID, false, None, None, held)
+                .await;
+            assert!(
+                matches!(outcome, VendorServiceOutcome::Pending),
+                "{outcome:?}"
+            );
+        }
+        let asked = server.received_requests().await.unwrap_or_default();
+        let bodies: Vec<serde_json::Value> = asked
+            .iter()
+            .map(|request| serde_json::from_slice(&request.body).expect("a JSON body"))
+            .collect();
+        let keys: Vec<&serde_json::Value> =
+            bodies.iter().map(|body| &body["gemSnapshotKeys"]).collect();
+        assert_eq!(keys, [&json!({ UUID: "9f3c01" }), &serde_json::Value::Null]);
+        assert!(bodies.iter().all(|body| body["gemBuilds"] == true));
+    }
+
     /// A gem patch's reference read without a download: its archive and
     /// stub as artifacts to fetch later, and the platform gems its
     /// registry lists, each with the patch of its patched build.
@@ -5596,12 +5648,14 @@ mod vendor_package_tests {
             .expect(1)
             .mount(&server)
             .await;
-        let outcome = auth_client(server.uri())
-            .fetch_vendor_reference(UUID, false, None, None)
+        let client = auth_client(server.uri());
+        let outcome = client
+            .fetch_vendor_reference(UUID, false, None, None, None)
             .await;
         let VendorServiceOutcome::Ready(reference) = outcome else {
             panic!("expected Ready, got {outcome:?}");
         };
+        assert_eq!(reference.gem_snapshot.as_deref(), Some("2"));
         // The archive takes the reference's top-level url when it has none
         // of its own; an artifact with no url is not listed.
         let archive = reference.archive.expect("the archive");
@@ -6678,7 +6732,12 @@ mod vendor_retry_tests {
             });
             let (error, retryable) = tokio::time::timeout(
                 Duration::from_secs(10),
-                api.request_vendor_references(&[UUID_A.to_string()], false, None),
+                api.request_vendor_references(
+                    &[UUID_A.to_string()],
+                    false,
+                    None,
+                    &GemSnapshotKeys::new(),
+                ),
             )
             .await
             .expect("body read must be bounded")
@@ -7015,7 +7074,7 @@ mod vendor_retry_tests {
         let url = |route: &str| format!("{}{route}", server.uri());
 
         let (c, slept) = hooked(&server.uri(), roomy(), 7);
-        c.request_vendor_references(&[UUID_A.to_string()], false, None)
+        c.request_vendor_references(&[UUID_A.to_string()], false, None, &GemSnapshotKeys::new())
             .await
             .expect("the retry after the 429 succeeds");
         assert_eq!(
@@ -7066,7 +7125,7 @@ mod vendor_retry_tests {
         let server = MockServer::start().await;
         mount_once_then(&server, "POST", POST_PATH, 503, granted(&server, UUID_A)).await;
         let (c, slept) = hooked(&server.uri(), fast(), 7);
-        c.request_vendor_references(&[UUID_A.to_string()], false, None)
+        c.request_vendor_references(&[UUID_A.to_string()], false, None, &GemSnapshotKeys::new())
             .await
             .expect("the retry succeeds");
         assert_eq!(*slept.lock().unwrap(), [fast().max_delay]);

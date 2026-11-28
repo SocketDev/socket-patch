@@ -1203,6 +1203,7 @@ pub async fn vendor_gem_previewing<'a>(
         gem: &label,
         from: BuildsFrom::Locked(platforms),
         standing,
+        snapshot: None,
     };
 
     // ── idempotent hot path ──────────────────────────────────────────────
@@ -1594,12 +1595,13 @@ fn gem_entry(
     base_purl: String,
     record: &PatchRecord,
     copy_rel: String,
-    builds: Vec<GemBuildEntry>,
+    (builds, snapshot): (Vec<GemBuildEntry>, Option<String>),
     file_inventory: Option<std::collections::BTreeMap<String, String>>,
     wiring: Vec<WiringRecord>,
 ) -> VendorEntry {
     VendorEntry {
         gem_builds: builds,
+        gem_snapshot: snapshot,
         ..VendorEntry::new(
             "gem".to_string(),
             base_purl,
@@ -1819,6 +1821,10 @@ pub(super) struct PlatformTrees<'a> {
     pub(super) gem: &'a str,
     pub(super) from: BuildsFrom<'a>,
     pub(super) standing: Standing,
+    /// A restore: the registry snapshot the ledger entry records for the
+    /// trees ([`VendorEntry::gem_snapshot`]), presented with the request
+    /// for the reference of the gem's fix.
+    pub(super) snapshot: Option<&'a str>,
 }
 
 /// One platform tree to stage: the patch it is unpacked from, and what its
@@ -1946,9 +1952,9 @@ async fn locked_build_sources(
     name: &str,
     trees: &PlatformTrees<'_>,
     platforms: &[String],
-) -> Result<Vec<BuildSource>, Box<VendorOutcome>> {
+) -> Result<(Vec<BuildSource>, Option<String>), Box<VendorOutcome>> {
     let policy = ServicePolicy::Refused;
-    let reference = fetch_served_reference(cfg, uuid).await;
+    let reference = fetch_served_reference(cfg, uuid, trees.snapshot).await;
     let served = policy.settle(
         reference,
         "platform gem",
@@ -1969,7 +1975,7 @@ async fn locked_build_sources(
         }
     }
     if missing.is_empty() {
-        return Ok(sources);
+        return Ok((sources, served.gem_snapshot));
     }
     let patched: Vec<&str> = sources.iter().map(|s| s.platform.as_str()).collect();
     Err(no_patched_build(trees, &missing, &patched))
@@ -1980,6 +1986,11 @@ async fn locked_build_sources(
 /// another patch or with other bytes, or withdrawn.
 /// Nothing is unpacked. Not an integrity failure: the same state follows
 /// an edited ledger, and neither is told from the other here.
+///
+/// A build that is only being made again is still named for an entry that
+/// records its registry snapshot, which the request presents
+/// ([`PlatformTrees::snapshot`]). An entry without one asks with no key and
+/// is answered no list during a rebuild: its message names both causes.
 pub(crate) const VENDOR_PREBUILT_REPLACED: &str = "vendor_prebuilt_replaced";
 
 /// The sources of the trees a ledger entry records, for a restore.
@@ -2005,9 +2016,9 @@ async fn recorded_build_sources(
     name: &str,
     trees: &PlatformTrees<'_>,
     builds: &[GemBuildEntry],
-) -> Result<Vec<BuildSource>, Box<VendorOutcome>> {
+) -> Result<(Vec<BuildSource>, Option<String>), Box<VendorOutcome>> {
     let policy = ServicePolicy::Refused;
-    let reference = fetch_served_reference(cfg, fix).await;
+    let reference = fetch_served_reference(cfg, fix, trees.snapshot).await;
     let served = policy.settle(
         reference,
         "platform gem",
@@ -2032,10 +2043,15 @@ async fn recorded_build_sources(
         };
         let now = listed.iter().find(|gem| gem.platform == built.platform);
         let Some((gem, uuid)) = now.and_then(|gem| Some((gem, gem.patch_uuid.as_deref()?))) else {
-            return Err(replaced(
-                "names no patched build for that platform now (it was withdrawn, or is being \
-                 made again)",
-            ));
+            // A copy with no snapshot on record asked with none, and is
+            // then answered no list while a build is being made again.
+            return Err(replaced(match trees.snapshot {
+                Some(_) => "names no patched build for that platform now (it was withdrawn)",
+                None => {
+                    "names no patched build for that platform now (it was withdrawn, or is \
+                     being made again: then run this again in a few minutes)"
+                }
+            }));
         };
         if !built.uuid.eq_ignore_ascii_case(uuid) {
             return Err(replaced(&format!(
@@ -2063,7 +2079,7 @@ async fn recorded_build_sources(
             },
         });
     }
-    Ok(sources)
+    Ok((sources, served.gem_snapshot))
 }
 
 /// Refuses a stub gemspec that is not the one of the platform gem being
@@ -2228,7 +2244,7 @@ async fn stage_platform_builds(
     name: &str,
     trees: &PlatformTrees<'_>,
     stage: &Path,
-) -> Result<(Vec<VendorWarning>, Vec<GemBuildEntry>), Box<VendorOutcome>> {
+) -> Result<(Vec<VendorWarning>, Vec<GemBuildEntry>, Option<String>), Box<VendorOutcome>> {
     use futures_util::StreamExt as _;
     let policy = ServicePolicy::Refused;
     let platforms: Vec<&str> = match &trees.from {
@@ -2243,7 +2259,7 @@ async fn stage_platform_builds(
             format!("unsafe gem platform `{platform}` for `{name}`"),
         ));
     }
-    let sources: Vec<BuildSource> = match &trees.from {
+    let (sources, snapshot): (Vec<BuildSource>, _) = match &trees.from {
         BuildsFrom::Locked(platforms) => {
             locked_build_sources(cfg, &record.uuid, name, trees, platforms).await?
         }
@@ -2350,7 +2366,7 @@ async fn stage_platform_builds(
             ),
         ));
     }
-    Ok((warnings, built))
+    Ok((warnings, built, snapshot))
 }
 
 impl BuildPin {
@@ -2510,13 +2526,14 @@ pub(super) async fn gem_platform_service_copy(
     uuid_dir: &Path,
     unwind_uuid_dir: bool,
     warnings: &mut Vec<VendorWarning>,
-) -> Result<Vec<GemBuildEntry>, Box<VendorOutcome>> {
+) -> Result<(Vec<GemBuildEntry>, Option<String>), Box<VendorOutcome>> {
     let cfg = service
         .filter(|cfg| cfg.service_enabled())
         .ok_or_else(|| Box::new(super::service_fetch::required()))?;
     let stage = stage_dir_for(copy_dir);
     let _ = remove_tree(&stage).await;
-    let (staged, built) = match stage_platform_builds(cfg, record, name, trees, &stage).await {
+    let staging = stage_platform_builds(cfg, record, name, trees, &stage).await;
+    let (staged, built, snapshot) = match staging {
         Ok(staged) => staged,
         Err(outcome) => {
             cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
@@ -2531,7 +2548,7 @@ pub(super) async fn gem_platform_service_copy(
         ));
     }
     warnings.extend(staged);
-    Ok(built)
+    Ok((built, snapshot))
 }
 
 /// `<uuid>/.gitignore` of a gem vendored as platform gems: re-includes
@@ -2611,7 +2628,7 @@ async fn preview_platform_builds(
         .map_err(|e| Box::new(refused("vendor_prebuilt_extract_failed", e.to_string())))?;
     stage_platform_builds(cfg, record, name, trees, scratch.path())
         .await
-        .map(|(_, built)| built)
+        .map(|(_, built, _)| built)
 }
 
 /// What a run would do with a gem `Gemfile.lock` names as precompiled
@@ -2696,10 +2713,11 @@ pub async fn preview_locked_builds(
         gem: &label,
         from: BuildsFrom::Locked(&prelude.platforms),
         standing,
+        snapshot: None,
     };
     let named = locked_build_sources(cfg, uuid, &prelude.name, &trees, &prelude.platforms).await;
     let sources = match named {
-        Ok(sources) => sources,
+        Ok((sources, _)) => sources,
         Err(outcome) => return refusal(*outcome),
     };
     // A patched build is only one to vendor once its own patch is served.
@@ -2736,8 +2754,8 @@ async fn materialise_patched_copy(
     unwind_uuid_dir: bool,
     service: Option<&VendorServiceConfig>,
     warnings: &mut Vec<VendorWarning>,
-) -> Result<(ApplyResult, Vec<GemBuildEntry>), Box<VendorOutcome>> {
-    let mut builds = Vec::new();
+) -> Result<(ApplyResult, (Vec<GemBuildEntry>, Option<String>)), Box<VendorOutcome>> {
+    let mut builds = (Vec::new(), None);
     match &trees.from {
         BuildsFrom::Locked([]) => {
             gem_service_copy(
@@ -13056,6 +13074,11 @@ mod tests {
                 // The ledger entry: each tree's platform, patch and digests,
                 // in lock order.
                 assert_eq!(entry.gem_builds, [built(UUID, DARWIN), built(UUID, LINUX)]);
+                assert_eq!(
+                    entry.gem_snapshot.as_deref(),
+                    Some("4"),
+                    "the snapshot the fix's registry named, for a later restore to present"
+                );
                 assert_eq!(entry.uuid, UUID);
                 assert_eq!(entry.artifact.path, rel);
                 let inventory = entry.artifact.file_inventory.as_ref().expect("inventory");

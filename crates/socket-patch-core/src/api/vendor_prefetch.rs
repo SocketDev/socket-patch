@@ -422,7 +422,12 @@ impl VendorPrefetch {
                 let mut kept = HashMap::new();
                 for (i, chunk) in order.chunks(MAX_REFERENCE_BATCH).enumerate() {
                     match client
-                        .request_vendor_references(chunk, free_only, vendor_url)
+                        .request_vendor_references(
+                            chunk,
+                            free_only,
+                            vendor_url,
+                            &crate::api::client::GemSnapshotKeys::new(),
+                        )
                         .await
                     {
                         Ok(mut results) => {

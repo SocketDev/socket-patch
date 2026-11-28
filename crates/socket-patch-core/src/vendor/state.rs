@@ -327,6 +327,14 @@ pub struct VendorEntry {
     /// as its ruby-platform tree.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gem_builds: Vec<GemBuildEntry>,
+    /// gem: the key of the registry snapshot the gem's fix named when the
+    /// trees of `gem_builds` were vendored. A restore presents it with its
+    /// request for that fix's reference
+    /// ([`GemSnapshotKeys`](crate::api::client::GemSnapshotKeys)), so the
+    /// patch service names the same builds while one of them is being
+    /// built again. Absent for a copy vendored before this was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gem_snapshot: Option<String>,
     /// True when vendored WITHOUT a manifest record — the posture of every
     /// `scan` / `get --mode vendored` entry (vendored mode writes no
     /// `.socket/manifest.json`); only the manifest-driven standalone
@@ -452,6 +460,7 @@ impl VendorEntry {
             pdm: None,
             pipenv: None,
             gem_builds: Vec::new(),
+            gem_snapshot: None,
             detached: false,
             record: None,
         }
@@ -2041,6 +2050,7 @@ mod tests {
             entry.gem_tree_platforms(),
             ["arm64-darwin", "x86_64-linux-gnu"]
         );
+        entry.gem_snapshot = Some("9f3c01".into());
         let key = "pkg:gem/nokogiri@1.18.10?platform=ruby";
         let mut state = VendorState::new();
         state.entries.insert(key.into(), entry.clone());
@@ -2049,6 +2059,7 @@ mod tests {
         let text = tokio::fs::read_to_string(root.join(VENDOR_STATE_REL))
             .await
             .unwrap();
+        assert!(text.contains(r#""gemSnapshot": "9f3c01""#), "{text}");
         let wire: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(
             wire["entries"][key]["gemBuilds"],
@@ -2812,6 +2823,7 @@ mod tests {
             pdm: None,
             pipenv: None,
             gem_builds: Vec::new(),
+            gem_snapshot: None,
         };
         let built = VendorEntry::npm(
             "pkg:npm/left-pad@1.3.0".to_string(),

@@ -126,6 +126,8 @@ pub(crate) struct ServedReference {
     /// serves them, each with the patch of its patched build if it has
     /// one; `None` when the reference carries no list.
     pub gem_builds: Option<Vec<GemPlatformChecksum>>,
+    /// gem: the key of the registry snapshot that list is served under.
+    pub gem_snapshot: Option<String>,
 }
 
 impl ServedReference {
@@ -141,6 +143,7 @@ impl From<VendorReference> for ServedReference {
             archive: reference.archive,
             secondary: reference.secondary,
             gem_builds: reference.gem_builds,
+            gem_snapshot: reference.gem_snapshot,
         }
     }
 }
@@ -224,10 +227,12 @@ pub(crate) async fn fetch_verified_archive(
 /// gems its registry serves. For a backend that vendors from other patches
 /// than `uuid`'s own archive (a gem's platform gems), so a gem with a
 /// locked platform that has no patched build costs one request and no
-/// download.
+/// download. `gem_snapshot` is the registry snapshot a ledger entry records
+/// for the gem, which the request then presents.
 pub(crate) async fn fetch_served_reference(
     cfg: &VendorServiceConfig,
     uuid: &str,
+    gem_snapshot: Option<&str>,
 ) -> ServiceArtifact<ServedReference> {
     let Some(client) = cfg.client.as_ref() else {
         return ServiceArtifact::Unavailable("vendor service not configured".to_string());
@@ -238,6 +243,7 @@ pub(crate) async fn fetch_served_reference(
             cfg.use_public_proxy,
             cfg.vendor_url.as_deref(),
             cfg.patch_server_url.as_deref(),
+            gem_snapshot,
         )
         .await;
     served_reference(outcome)
