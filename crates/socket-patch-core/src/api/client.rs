@@ -3545,12 +3545,8 @@ pub fn gem_snapshots_for(uuids: &[String], held: &GemSnapshotKeys) -> GemSnapsho
 /// such a request), and the registry snapshots `held` names for `uuids`
 /// (`gemSnapshotKeys`, left out when it names none).
 pub fn provider_references_request(uuids: &[String], held: &GemSnapshotKeys) -> serde_json::Value {
-    let presented = gem_snapshots_for(uuids, held);
-    let mut request = serde_json::json!({ "uuids": uuids, "gemBuilds": true });
-    if !presented.is_empty() {
-        request["gemSnapshotKeys"] = serde_json::json!(presented);
-    }
-    request
+    let request = PackageVendorRequest::new(uuids, false, gem_snapshots_for(uuids, held));
+    serde_json::json!(request)
 }
 
 /// The patch-data calls the hosted flow makes, as an object-safe trait so an
